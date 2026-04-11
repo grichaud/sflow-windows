@@ -24,7 +24,9 @@ from config import LOGO_PATH, APP_DATA_DIR, GROQ_API_KEY
 
 
 def _ensure_accessibility() -> bool:
-    """Prompt macOS to grant Accessibility if not trusted. Returns True if already trusted."""
+    """On macOS: prompt for Accessibility permission. On Windows: no-op."""
+    if sys.platform != "darwin":
+        return True
     try:
         from ApplicationServices import AXIsProcessTrustedWithOptions
         return AXIsProcessTrustedWithOptions({"AXTrustedCheckOptionPrompt": True})
@@ -32,9 +34,68 @@ def _ensure_accessibility() -> bool:
         return True
 
 
-# LaunchAgent constants
-_LAUNCH_AGENT_LABEL = "so.saasfactory.sflow"
-_PLIST_PATH = os.path.expanduser(f"~/Library/LaunchAgents/{_LAUNCH_AGENT_LABEL}.plist")
+# ---------------------------------------------------------------------------
+# Launch at login
+# ---------------------------------------------------------------------------
+if sys.platform == "win32":
+    import winreg
+    _RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+    _APP_NAME = "SFlow"
+
+    def _is_launch_at_login() -> bool:
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _RUN_KEY) as key:
+                winreg.QueryValueEx(key, _APP_NAME)
+                return True
+        except FileNotFoundError:
+            return False
+
+    def _set_launch_at_login(enabled: bool):
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _RUN_KEY, 0, winreg.KEY_SET_VALUE) as key:
+            if enabled:
+                exe = sys.executable if getattr(sys, "frozen", False) else os.path.abspath(sys.argv[0])
+                winreg.SetValueEx(key, _APP_NAME, 0, winreg.REG_SZ, f'"{exe}"')
+            else:
+                try:
+                    winreg.DeleteValue(key, _APP_NAME)
+                except FileNotFoundError:
+                    pass
+
+else:
+    # macOS LaunchAgent
+    _LAUNCH_AGENT_LABEL = "so.saasfactory.sflow"
+    _PLIST_PATH = os.path.expanduser(f"~/Library/LaunchAgents/{_LAUNCH_AGENT_LABEL}.plist")
+
+    def _is_launch_at_login() -> bool:
+        return os.path.exists(_PLIST_PATH)
+
+    def _set_launch_at_login(enabled: bool):
+        if enabled:
+            exe = sys.executable if getattr(sys, "frozen", False) else os.path.abspath(sys.argv[0])
+            plist = f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{_LAUNCH_AGENT_LABEL}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{exe}</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <false/>
+</dict>
+</plist>"""
+            os.makedirs(os.path.dirname(_PLIST_PATH), exist_ok=True)
+            with open(_PLIST_PATH, "w") as f:
+                f.write(plist)
+            subprocess.run(["launchctl", "load", _PLIST_PATH], capture_output=True)
+        else:
+            if os.path.exists(_PLIST_PATH):
+                subprocess.run(["launchctl", "unload", _PLIST_PATH], capture_output=True)
+                os.remove(_PLIST_PATH)
 
 
 # ---------------------------------------------------------------------------
@@ -83,47 +144,6 @@ class FirstRunDialog(QDialog):
 
 
 # ---------------------------------------------------------------------------
-# Launch at Login
-# ---------------------------------------------------------------------------
-def _is_launch_at_login() -> bool:
-    return os.path.exists(_PLIST_PATH)
-
-
-def _set_launch_at_login(enabled: bool):
-    if enabled:
-        if getattr(sys, "frozen", False):
-            # In .app bundle: executable is Contents/MacOS/SFlow
-            exe = sys.executable
-        else:
-            exe = os.path.abspath(sys.argv[0])
-
-        plist = f"""<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>{_LAUNCH_AGENT_LABEL}</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>{exe}</string>
-    </array>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <false/>
-</dict>
-</plist>"""
-        os.makedirs(os.path.dirname(_PLIST_PATH), exist_ok=True)
-        with open(_PLIST_PATH, "w") as f:
-            f.write(plist)
-        subprocess.run(["launchctl", "load", _PLIST_PATH], capture_output=True)
-    else:
-        if os.path.exists(_PLIST_PATH):
-            subprocess.run(["launchctl", "unload", _PLIST_PATH], capture_output=True)
-            os.remove(_PLIST_PATH)
-
-
-# ---------------------------------------------------------------------------
 # System tray
 # ---------------------------------------------------------------------------
 def _setup_tray(app: QApplication, port: int) -> QSystemTrayIcon:
@@ -143,12 +163,14 @@ def _setup_tray(app: QApplication, port: int) -> QSystemTrayIcon:
     menu.addAction(status)
     menu.addSeparator()
 
+    import webbrowser
     dashboard = QAction(f"Abrir Dashboard (:{port})", menu)
-    dashboard.triggered.connect(lambda: subprocess.run(["open", f"http://localhost:{port}"], capture_output=True))
+    dashboard.triggered.connect(lambda: webbrowser.open(f"http://localhost:{port}"))
     menu.addAction(dashboard)
     menu.addSeparator()
 
-    login_action = QAction("Iniciar con macOS", menu)
+    login_label = "Iniciar con Windows" if sys.platform == "win32" else "Iniciar con macOS"
+    login_action = QAction(login_label, menu)
     login_action.setCheckable(True)
     login_action.setChecked(_is_launch_at_login())
     login_action.toggled.connect(_set_launch_at_login)
@@ -259,12 +281,13 @@ def main():
         if dialog.exec() != QDialog.DialogCode.Accepted:
             sys.exit(0)
 
-    # Hide from Dock AFTER first-run dialog — menu bar only
-    try:
-        import AppKit
-        AppKit.NSApp.setActivationPolicy_(AppKit.NSApplicationActivationPolicyAccessory)
-    except Exception:
-        pass  # Non-critical: just means Dock icon stays
+    # Hide from Dock on macOS (menu bar only) — not needed on Windows
+    if sys.platform == "darwin":
+        try:
+            import AppKit
+            AppKit.NSApp.setActivationPolicy_(AppKit.NSApplicationActivationPolicyAccessory)
+        except Exception:
+            pass
 
     # Start web dashboard
     port = start_web_server()
