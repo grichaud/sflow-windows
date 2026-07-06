@@ -1,4 +1,7 @@
-PyQt6>=6.7.0
+# Pinned to 6.7.x LTS: Qt 6.11 fails to load on some Windows 10 builds
+# (ImportError: DLL load failed importing QtCore: procedure not found).
+PyQt6==6.7.1
+PyQt6-Qt6==6.7.3
 sounddevice>=0.4.6
 numpy>=1.26.0
 pynput>=1.7.6
