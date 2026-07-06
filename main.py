@@ -53,8 +53,17 @@ if sys.platform == "win32":
     def _set_launch_at_login(enabled: bool):
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _RUN_KEY, 0, winreg.KEY_SET_VALUE) as key:
             if enabled:
-                exe = sys.executable if getattr(sys, "frozen", False) else os.path.abspath(sys.argv[0])
-                winreg.SetValueEx(key, _APP_NAME, 0, winreg.REG_SZ, f'"{exe}"')
+                if getattr(sys, "frozen", False):
+                    cmd = f'"{sys.executable}"'
+                else:
+                    # Dev mode: launch the script with the venv's windowed interpreter
+                    # (pythonw.exe -> no console window at boot). Running the bare .py
+                    # would use the system file association (wrong Python, no venv).
+                    exe_dir = os.path.dirname(sys.executable)
+                    pythonw = os.path.join(exe_dir, "pythonw.exe")
+                    interp = pythonw if os.path.exists(pythonw) else sys.executable
+                    cmd = f'"{interp}" "{os.path.abspath(sys.argv[0])}"'
+                winreg.SetValueEx(key, _APP_NAME, 0, winreg.REG_SZ, cmd)
             else:
                 try:
                     winreg.DeleteValue(key, _APP_NAME)
