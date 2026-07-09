@@ -4,7 +4,48 @@ import queue
 import time
 import numpy as np
 import sounddevice as sd
-from config import SAMPLE_RATE, CHANNELS, AUDIO_DTYPE, BLOCK_SIZE
+from config import SAMPLE_RATE, CHANNELS, AUDIO_DTYPE, BLOCK_SIZE, MIC_DEVICE_HINTS
+
+
+def resolve_input_device():
+    """Pick a stable microphone instead of blindly trusting the OS default.
+
+    Windows can switch the default input device to a dead/incompatible input
+    (e.g. a headphone jack with no working mic) when audio hardware is plugged
+    in, which silently breaks capture. We look for the first input device whose
+    name matches one of MIC_DEVICE_HINTS *and* that supports our capture
+    settings (16 kHz mono). The MME host API resamples, so it's the most
+    compatible. Returns a device index, or None to fall back to the OS default.
+    """
+    try:
+        devices = sd.query_devices()
+    except Exception as e:
+        print(f"Could not query audio devices: {e}")
+        return None
+
+    def supports(idx: int) -> bool:
+        try:
+            sd.check_input_settings(
+                device=idx,
+                samplerate=SAMPLE_RATE,
+                channels=CHANNELS,
+                dtype=AUDIO_DTYPE,
+            )
+            return True
+        except Exception:
+            return False
+
+    for hint in MIC_DEVICE_HINTS:
+        hint_l = hint.lower()
+        matches = [
+            i for i, d in enumerate(devices)
+            if d["max_input_channels"] > 0 and hint_l in d["name"].lower()
+        ]
+        for i in matches:
+            if supports(i):
+                return i
+
+    return None  # no preferred mic available → OS default
 
 
 class AudioRecorder:
@@ -31,14 +72,25 @@ class AudioRecorder:
                 break
         self.is_recording = True
         self._start_time = time.time()
-        self.stream = sd.InputStream(
+        device = resolve_input_device()
+        try:
+            self.stream = self._open_stream(device)
+        except Exception as e:
+            # Chosen device rejected our settings (e.g. sample rate) — fall
+            # back to the OS default rather than failing the recording.
+            print(f"Failed to open input device {device!r} ({e}); using OS default.")
+            self.stream = self._open_stream(None)
+        self.stream.start()
+
+    def _open_stream(self, device) -> sd.InputStream:
+        return sd.InputStream(
             samplerate=SAMPLE_RATE,
             channels=CHANNELS,
             dtype=AUDIO_DTYPE,
             blocksize=BLOCK_SIZE,
+            device=device,
             callback=self._callback,
         )
-        self.stream.start()
 
     def stop(self) -> float:
         """Stop recording and return duration in seconds."""

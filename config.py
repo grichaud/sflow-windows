@@ -40,6 +40,18 @@ CHANNELS = 1
 AUDIO_DTYPE = "int16"
 BLOCK_SIZE = 1024
 
+# Preferred input device (microphone).
+# SFlow does NOT blindly follow the Windows default input device: plugging in
+# headphones can switch the default to a dead/incompatible input (e.g. a
+# headphone jack with no working mic), which silently breaks transcription.
+# Instead the recorder picks the first input device whose name contains one of
+# these hints (case-insensitive) AND that supports 16 kHz mono capture. If none
+# match, it falls back to the OS default. Edit/reorder to pin a different mic.
+MIC_DEVICE_HINTS = [
+    "Microphone Array",   # laptop built-in mic (Intel Smart Sound)
+    "Smart Sound",
+]
+
 # UI
 PILL_WIDTH_IDLE = 34
 PILL_WIDTH_RECORDING = 100

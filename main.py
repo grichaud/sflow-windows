@@ -273,9 +273,55 @@ class SFlowApp(QObject):
 
 
 # ---------------------------------------------------------------------------
+# Single-instance guard
+# ---------------------------------------------------------------------------
+# SFlow is a global-hotkey tray app: two copies fight over the hotkey and the
+# microphone (each hotkey press opens a competing audio stream), which makes
+# recording flaky or silent. This venv is based on Anaconda, and the venv
+# interpreter can end up re-launching a second copy under the Anaconda base
+# python — so we defensively refuse to run more than one instance at a time.
+_INSTANCE_LOCK = None  # keep the handle/socket alive for the process lifetime
+
+
+def _acquire_single_instance() -> bool:
+    """Return True if this is the only running instance, False otherwise.
+
+    Note: with this Anaconda-based venv, `pythonw.exe` is a redirect launcher
+    that re-execs the base interpreter, so SFlow normally shows up as two OS
+    processes (launcher stub + real interpreter). Only the real interpreter
+    runs this code, so the guard still sees exactly one instance.
+    """
+    global _INSTANCE_LOCK
+    if sys.platform == "win32":
+        import ctypes
+        ERROR_ALREADY_EXISTS = 183
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.CreateMutexW(None, True, "Local\\SFlow_SingleInstance")
+        if not handle or kernel32.GetLastError() == ERROR_ALREADY_EXISTS:
+            return False
+        _INSTANCE_LOCK = handle
+        return True
+    # macOS/Linux: hold a fixed loopback port for the process lifetime.
+    import socket
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.bind(("127.0.0.1", 49321))
+    except OSError:
+        s.close()
+        return False
+    s.listen(1)
+    _INSTANCE_LOCK = s
+    return True
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 def main():
+    # Refuse to start a duplicate (must run BEFORE anything grabs the mic/hotkey).
+    if not _acquire_single_instance():
+        sys.exit(0)
+
     app = QApplication(sys.argv)
     app.setApplicationName("SFlow")
     app.setQuitOnLastWindowClosed(False)
