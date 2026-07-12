@@ -48,6 +48,76 @@ def resolve_input_device():
     return None  # no preferred mic available → OS default
 
 
+def _hostapi_name(index: int) -> str:
+    try:
+        return sd.query_hostapis(index)["name"]
+    except Exception:
+        return ""
+
+
+def _find_input_by_hostapi(hostapi_name: str, hints):
+    """First input device on a given host API whose name matches a hint."""
+    try:
+        devices = sd.query_devices()
+    except Exception:
+        return None, None
+    for i, d in enumerate(devices):
+        if d["max_input_channels"] <= 0:
+            continue
+        if _hostapi_name(d["hostapi"]) != hostapi_name:
+            continue
+        name = d["name"].lower()
+        if any(h.lower() in name for h in hints):
+            return i, d
+    return None, None
+
+
+def reset_capture_endpoint() -> bool:
+    """Re-initialize the mic's capture pipeline in the Windows audio engine.
+
+    An Intel Smart Sound app (e.g. CallAssist) that opens the mic via WASAPI
+    together with a render loopback can leave the endpoint's on-DSP effects
+    (AEC/AGC/noise-suppression APO) stuck emitting near-silence for ALL shared
+    audio-engine capture — MME, DirectSound and shared-WASAPI — which is what
+    SFlow records, so it transcribes nothing (Whisper hallucinates "Gracias.").
+    Restarting SFlow does NOT help (same shared engine). Opening the mic via
+    WDM-KS (kernel streaming) or WASAPI-exclusive bypasses the shared engine and
+    re-arms the endpoint at the driver level — the same thing opening Windows
+    "Sound settings" does. We briefly open+close such a stream to clear it.
+
+    Returns True if a reset stream opened. Safe no-op (False) if the device is
+    busy/unavailable — normal capture then proceeds regardless.
+    """
+    attempts = [("Windows WDM-KS", None)]
+    try:
+        attempts.append(("Windows WASAPI", sd.WasapiSettings(exclusive=True)))
+    except Exception:
+        pass  # non-Windows / WASAPI unavailable
+
+    for hostapi_name, extra in attempts:
+        idx, dev = _find_input_by_hostapi(hostapi_name, MIC_DEVICE_HINTS)
+        if idx is None:
+            continue
+        sr = int(dev["default_samplerate"])  # WDM-KS/exclusive need the native rate, not 16k
+        for ch in (1, int(dev["max_input_channels"])):
+            if ch < 1:
+                continue
+            try:
+                s = sd.InputStream(
+                    device=idx, samplerate=sr, channels=ch, dtype="int16",
+                    callback=lambda *a: None,  # WDM-KS requires a callback
+                    extra_settings=extra,
+                )
+                s.start()
+                time.sleep(0.05)
+                s.stop()
+                s.close()
+                return True
+            except Exception:
+                continue
+    return False
+
+
 class AudioRecorder:
     def __init__(self):
         self.audio_queue = queue.Queue()  # For UI visualization
@@ -55,15 +125,23 @@ class AudioRecorder:
         self.stream: sd.InputStream | None = None
         self.is_recording = False
         self._start_time = 0.0
+        self._peak = 0  # loudest sample this recording (to detect a wedged mic)
+        # Start "suspect" so the very first take after launch re-arms the mic —
+        # handles the common case of restarting SFlow *because* it went silent.
+        self._suspect_stuck = True
 
     def _callback(self, indata: np.ndarray, frames: int, time_info, status):
         if status:
             print(f"Audio status: {status}")
         self.audio_queue.put(indata.copy())
         self.frames.append(indata.copy())
+        peak = int(np.abs(indata).max())
+        if peak > self._peak:
+            self._peak = peak
 
     def start(self):
         self.frames.clear()
+        self._peak = 0
         # Drain any old data from the queue
         while not self.audio_queue.empty():
             try:
@@ -72,6 +150,12 @@ class AudioRecorder:
                 break
         self.is_recording = True
         self._start_time = time.time()
+        # If the previous take came back silent, the mic endpoint is likely
+        # wedged (an Intel SST / WASAPI app such as CallAssist left it stuck).
+        # Re-arm it before capturing so this take isn't silent too.
+        if self._suspect_stuck:
+            reset_capture_endpoint()
+            time.sleep(0.05)
         device = resolve_input_device()
         try:
             self.stream = self._open_stream(device)
@@ -100,6 +184,12 @@ class AudioRecorder:
             self.stream.stop()
             self.stream.close()
             self.stream = None
+        # A recording of real length that captured essentially no signal means
+        # the mic endpoint is wedged (see reset_capture_endpoint). Flag it so the
+        # NEXT take re-arms the endpoint first, self-healing without user action.
+        self._suspect_stuck = duration > 0.5 and self._peak < 30
+        if self._suspect_stuck:
+            print(f"Capture looked stuck (peak={self._peak}); will re-arm mic on next take.")
         return duration
 
     def get_wav_buffer(self) -> io.BytesIO:
