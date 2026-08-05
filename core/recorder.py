@@ -4,18 +4,47 @@ import queue
 import time
 import numpy as np
 import sounddevice as sd
-from config import SAMPLE_RATE, CHANNELS, AUDIO_DTYPE, BLOCK_SIZE, MIC_DEVICE_HINTS
+from config import (
+    SAMPLE_RATE, CHANNELS, AUDIO_DTYPE, BLOCK_SIZE, MIC_DEVICE_HINTS,
+    SILENCE_PEAK_THRESHOLD,
+)
 
 
-def resolve_input_device():
-    """Pick a stable microphone instead of blindly trusting the OS default.
+def _supports(idx: int) -> bool:
+    try:
+        sd.check_input_settings(
+            device=idx,
+            samplerate=SAMPLE_RATE,
+            channels=CHANNELS,
+            dtype=AUDIO_DTYPE,
+        )
+        return True
+    except Exception:
+        return False
 
-    Windows can switch the default input device to a dead/incompatible input
-    (e.g. a headphone jack with no working mic) when audio hardware is plugged
-    in, which silently breaks capture. We look for the first input device whose
-    name matches one of MIC_DEVICE_HINTS *and* that supports our capture
-    settings (16 kHz mono). The MME host API resamples, so it's the most
-    compatible. Returns a device index, or None to fall back to the OS default.
+
+def _pinned_device(devices):
+    """First input matching MIC_DEVICE_HINTS that can do 16 kHz mono, else None."""
+    for hint in MIC_DEVICE_HINTS:
+        hint_l = hint.lower()
+        for i, d in enumerate(devices):
+            if d["max_input_channels"] > 0 and hint_l in d["name"].lower() and _supports(i):
+                return i
+    return None
+
+
+def resolve_input_device(prefer_pinned: bool = False):
+    """Pick the capture device, honoring the user's Windows default input.
+
+    The default is what the user deliberately chooses when they plug in a headset, so
+    following it is the behaviour they expect — SFlow used to ignore it entirely and
+    record the built-in array while the user spoke into a headset boom mic.
+
+    The reason it ignored it still exists though: plugging headphones into the 3.5 mm
+    jack can make Windows select a jack input with no working mic, and capture goes
+    silently dead. So MIC_DEVICE_HINTS remains as a fallback, used when the default
+    can't do 16 kHz mono, or when `prefer_pinned` is set because a take came back
+    silent on the default. Returns a device index, or None for "let PortAudio decide".
     """
     try:
         devices = sd.query_devices()
@@ -23,29 +52,26 @@ def resolve_input_device():
         print(f"Could not query audio devices: {e}")
         return None
 
-    def supports(idx: int) -> bool:
+    if not prefer_pinned:
         try:
-            sd.check_input_settings(
-                device=idx,
-                samplerate=SAMPLE_RATE,
-                channels=CHANNELS,
-                dtype=AUDIO_DTYPE,
-            )
-            return True
+            default_idx = sd.default.device[0]
         except Exception:
-            return False
+            default_idx = None
+        if (isinstance(default_idx, int) and 0 <= default_idx < len(devices)
+                and devices[default_idx]["max_input_channels"] > 0
+                and _supports(default_idx)):
+            return default_idx
 
-    for hint in MIC_DEVICE_HINTS:
-        hint_l = hint.lower()
-        matches = [
-            i for i, d in enumerate(devices)
-            if d["max_input_channels"] > 0 and hint_l in d["name"].lower()
-        ]
-        for i in matches:
-            if supports(i):
-                return i
+    return _pinned_device(devices)
 
-    return None  # no preferred mic available → OS default
+
+def device_name(idx) -> str:
+    if idx is None:
+        return "(PortAudio default)"
+    try:
+        return sd.query_devices(idx)["name"]
+    except Exception:
+        return f"device {idx}"
 
 
 def _hostapi_name(index: int) -> str:
@@ -130,15 +156,67 @@ class AudioRecorder:
         # proactive warm-up on the first take added latency and could leave a
         # sliver of leading silence that Whisper transcribes as "Gracias.".
         self._suspect_stuck = False
+        # Set once the Windows default input proves it captures nothing, so we switch
+        # to MIC_DEVICE_HINTS (the dead-3.5mm-jack case) instead of staying deaf.
+        self._prefer_pinned = False
 
     def _callback(self, indata: np.ndarray, frames: int, time_info, status):
         if status:
             print(f"Audio status: {status}")
+        if not self.is_recording:
+            return  # stream is kept open between takes; ignore anything outside a take
         self.audio_queue.put(indata.copy())
         self.frames.append(indata.copy())
         peak = int(np.abs(indata).max())
         if peak > self._peak:
             self._peak = peak
+
+    def _ensure_stream(self):
+        """Open the capture stream if it isn't already. Kept open across takes.
+
+        Opening a stream costs ~700 ms on this machine (MME; DirectSound is no better),
+        and it used to happen inside the hotkey handler on the UI thread for every
+        single take. That froze the app for ~1 s per dictation: the first second of
+        speech was never captured (so short takes reached Whisper near-empty and came
+        back as "Gracias.") and the user's key presses queued up behind the freeze and
+        were applied to the wrong take, which looked like recording "cutting out".
+        Starting an already-open stream costs 0.4 ms instead.
+        """
+        if self.stream is not None:
+            return
+        device = resolve_input_device(self._prefer_pinned)
+        try:
+            self.stream = self._open_stream(device)
+        except Exception as e:
+            # Chosen device rejected our settings (e.g. sample rate) — fall back to
+            # the OS default rather than failing the recording.
+            print(f"Failed to open input device {device!r} ({e}); using OS default.")
+            self.stream = self._open_stream(None)
+            device = None
+        print(f"Mic open: {device_name(device)}"
+              f"{' [pinned fallback]' if self._prefer_pinned else ' [Windows default]'}")
+
+    def _close_stream(self):
+        if self.stream is None:
+            return
+        try:
+            self.stream.stop()
+            self.stream.close()
+        except Exception as e:
+            print(f"Error closing stream: {e}")
+        finally:
+            self.stream = None
+
+    def prewarm(self):
+        """Open the mic ahead of the first hotkey press so that take isn't slow either.
+
+        Safe to call off the main thread; a failure here is not fatal because start()
+        opens the stream on demand anyway.
+        """
+        try:
+            self._ensure_stream()
+        except Exception as e:
+            print(f"Mic prewarm failed (will retry on first take): {e}")
 
     def start(self):
         self.frames.clear()
@@ -149,23 +227,27 @@ class AudioRecorder:
                 self.audio_queue.get_nowait()
             except queue.Empty:
                 break
-        self.is_recording = True
-        self._start_time = time.time()
         # If the previous take came back silent, the mic endpoint is likely
         # wedged (an Intel SST / WASAPI app such as CallAssist left it stuck).
-        # Re-arm it before capturing so this take isn't silent too.
+        # Re-arm it before capturing so this take isn't silent too. The re-arm
+        # needs exclusive access, so the persistent stream must be closed first.
         if self._suspect_stuck:
+            self._close_stream()
             reset_capture_endpoint()
             time.sleep(0.05)
-        device = resolve_input_device()
+
+        self._ensure_stream()
+        self.is_recording = True  # set before start(): the callback drops idle audio
+        self._start_time = time.time()
         try:
-            self.stream = self._open_stream(device)
+            self.stream.start()
         except Exception as e:
-            # Chosen device rejected our settings (e.g. sample rate) — fall
-            # back to the OS default rather than failing the recording.
-            print(f"Failed to open input device {device!r} ({e}); using OS default.")
-            self.stream = self._open_stream(None)
-        self.stream.start()
+            # The device may have vanished (headphones unplugged) — rebuild once.
+            print(f"Stream start failed ({e}); rebuilding.")
+            self._close_stream()
+            self._ensure_stream()
+            self._start_time = time.time()
+            self.stream.start()
 
     def _open_stream(self, device) -> sd.InputStream:
         return sd.InputStream(
@@ -182,15 +264,34 @@ class AudioRecorder:
         self.is_recording = False
         duration = time.time() - self._start_time
         if self.stream:
-            self.stream.stop()
-            self.stream.close()
-            self.stream = None
+            try:
+                self.stream.stop()  # stays OPEN — reopening costs ~700 ms (_ensure_stream)
+            except Exception as e:
+                print(f"Error stopping stream: {e}")
+                self._close_stream()
         # A recording of real length that captured essentially no signal means
         # the mic endpoint is wedged (see reset_capture_endpoint). Flag it so the
         # NEXT take re-arms the endpoint first, self-healing without user action.
-        self._suspect_stuck = duration > 0.5 and self._peak < 30
+        self._suspect_stuck = duration > 0.5 and self._peak < SILENCE_PEAK_THRESHOLD
         if self._suspect_stuck:
             print(f"Capture looked stuck (peak={self._peak}); will re-arm mic on next take.")
+            # The Windows default input gave us nothing (classic dead 3.5 mm jack mic).
+            # Stop trusting it and pin to the built-in array from here on.
+            if not self._prefer_pinned:
+                self._prefer_pinned = True
+                self._close_stream()
+                print("Default input captured silence; falling back to the pinned mic.")
+        # Zero frames means this stream delivered nothing at all (device pulled, or the
+        # endpoint died under us). Drop it so the next take builds a fresh one instead
+        # of reusing a stream that will stay silent forever.
+        #
+        # Only for takes long enough that frames SHOULD have arrived. A take of a few
+        # milliseconds legitimately captures nothing (one block is 64 ms at 16 kHz), and
+        # tearing the stream down for those made the next real dictation pay the ~700 ms
+        # reopen again — reintroducing the very lost-audio bug this design removes.
+        if duration > 0.5 and not self.frames:
+            print(f"Take of {duration:.1f}s captured 0 frames; rebuilding the stream.")
+            self._close_stream()
         return duration
 
     def get_wav_buffer(self) -> io.BytesIO:
@@ -206,6 +307,15 @@ class AudioRecorder:
             wf.writeframes(audio_data.tobytes())
         buf.seek(0)
         return buf
+
+    @property
+    def peak(self) -> int:
+        """Loudest int16 sample of the last take (0 if nothing was captured)."""
+        return self._peak
+
+    def captured_sound(self) -> bool:
+        """True if this take actually contains audio worth transcribing."""
+        return bool(self.frames) and self._peak >= SILENCE_PEAK_THRESHOLD
 
     def get_duration(self) -> float:
         if not self.frames:

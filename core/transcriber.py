@@ -1,7 +1,7 @@
 import io
 import os
 from groq import Groq
-from config import GROQ_MODEL, WHISPER_LANGUAGE
+from config import GROQ_MODEL, WHISPER_LANGUAGE, WHISPER_PROMPT
 
 
 class Transcriber:
@@ -23,12 +23,16 @@ class Transcriber:
         data = wav_buffer.read()
         if len(data) < 100:
             return ""
+        kwargs = {}
+        if WHISPER_PROMPT:  # empty = don't send the param at all (see config.py)
+            kwargs["prompt"] = WHISPER_PROMPT
         transcription = self._get_client().audio.transcriptions.create(
             file=("recording.wav", data),
             model=GROQ_MODEL,
             language=WHISPER_LANGUAGE,
             response_format="text",
             temperature=0.0,
+            **kwargs,
         )
         text = transcription.strip() if isinstance(transcription, str) else str(transcription).strip()
         return text

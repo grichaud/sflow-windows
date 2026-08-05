@@ -1,6 +1,8 @@
 import sys
 import time
 
+from config import SYNTHETIC_INPUT_TAG
+
 _saved_hwnd: int | None = None
 
 
@@ -64,11 +66,17 @@ if sys.platform == "win32":
         user32.CloseClipboard()
 
     def _send_ctrl_v():
-        """Send Ctrl+V keypress using SendInput."""
+        """Send Ctrl+V keypress using SendInput.
+
+        Every event is stamped with SYNTHETIC_INPUT_TAG in dwExtraInfo so SFlow's own
+        hotkey hook can tell these apart from real typing and ignore them — otherwise
+        this Ctrl feeds straight back into the Ctrl+Alt shortcut (see config.py).
+        """
         INPUT_KEYBOARD = 1
         KEYEVENTF_KEYUP = 0x0002
         VK_CONTROL = 0x11
         VK_V = 0x56
+        ULONG_PTR = ctypes.wintypes.WPARAM  # pointer-sized, as the Win32 API expects
 
         class KEYBDINPUT(ctypes.Structure):
             _fields_ = [
@@ -76,7 +84,7 @@ if sys.platform == "win32":
                 ("wScan", ctypes.wintypes.WORD),
                 ("dwFlags", ctypes.wintypes.DWORD),
                 ("time", ctypes.wintypes.DWORD),
-                ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong)),
+                ("dwExtraInfo", ULONG_PTR),
             ]
 
         class INPUT(ctypes.Structure):
@@ -101,6 +109,9 @@ if sys.platform == "win32":
         inputs[3].type = INPUT_KEYBOARD
         inputs[3].ki.wVk = VK_CONTROL
         inputs[3].ki.dwFlags = KEYEVENTF_KEYUP
+
+        for i in range(4):
+            inputs[i].ki.dwExtraInfo = SYNTHETIC_INPUT_TAG
 
         ctypes.windll.user32.SendInput(4, inputs, ctypes.sizeof(INPUT))
 

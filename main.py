@@ -14,6 +14,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QObject, QTimer, pyqtSignal, pyqtSlot
 from PyQt6.QtGui import QIcon, QPixmap, QAction
 
+from core.log import setup_logging, get_logger
 from ui.pill_widget import PillWidget
 from core.recorder import AudioRecorder
 from core.transcriber import Transcriber
@@ -21,7 +22,13 @@ from core.hotkey import HotkeyListener
 from core.clipboard import paste_text, save_frontmost_app
 from db.database import TranscriptionDB
 from web.server import start_web_server
-from config import LOGO_PATH, APP_DATA_DIR, GROQ_API_KEY
+from config import (
+    LOGO_PATH, APP_DATA_DIR, GROQ_API_KEY, GROQ_MODEL, WHISPER_LANGUAGE,
+    SILENCE_PEAK_THRESHOLD, HOTKEY_RELEASE_GRACE_MS,
+)
+
+setup_logging()
+log = get_logger("sflow.app")
 
 
 def _ensure_accessibility() -> bool:
@@ -229,6 +236,18 @@ class SFlowApp(QObject):
         self._hold_watchdog.setInterval(350)
         self._hold_watchdog.timeout.connect(self._check_hold)
 
+        # Debounce for a chattering Ctrl key — see HOTKEY_RELEASE_GRACE_MS.
+        self._release_grace = QTimer(self)
+        self._release_grace.setSingleShot(True)
+        self._release_grace.setInterval(HOTKEY_RELEASE_GRACE_MS)
+        self._release_grace.timeout.connect(self._finish_recording)
+        self._chatter_recoveries = 0
+
+        # Health heartbeat — see _beat().
+        self._heartbeat = QTimer(self)
+        self._heartbeat.setInterval(60_000)
+        self._heartbeat.timeout.connect(self._beat)
+
         # MUST use QueuedConnection: pynput emits from its own thread
         self.hotkey.pressed.connect(self._on_hotkey_pressed, Qt.ConnectionType.QueuedConnection)
         self.hotkey.released.connect(self._on_hotkey_released, Qt.ConnectionType.QueuedConnection)
@@ -239,11 +258,60 @@ class SFlowApp(QObject):
         self.hotkey.start()
         self.pill.show()
         self.pill.set_state(PillWidget.STATE_IDLE)
+        log.info("SFlow started | model=%s language=%s", GROQ_MODEL, WHISPER_LANGUAGE)
+        self._heartbeat.start()
+        # Open the mic now, off the UI thread, so the first dictation is as fast as
+        # the rest (opening costs ~700 ms — see AudioRecorder._ensure_stream).
+        threading.Thread(target=self._prewarm_mic, daemon=True).start()
+
+    def _prewarm_mic(self):
+        started = time.time()
+        self.recorder.prewarm()
+        log.info("mic prewarmed in %.0f ms", (time.time() - started) * 1000)
+
+    def _beat(self):
+        """Periodic health line, so a silent failure leaves a trace in the log.
+
+        Also revives the hotkey listener if its thread died — otherwise the shortcut
+        is dead until SFlow is restarted by hand, with nothing explaining why.
+        """
+        log.info(
+            "heartbeat | recording=%s key_events=%d last_key=%.0fs listener_alive=%s "
+            "self_keys_filtered=%d key_bounces_absorbed=%d",
+            self.recorder.is_recording,
+            self.hotkey.events_seen(),
+            self.hotkey.seconds_since_last_event(),
+            self.hotkey.is_alive(),
+            self.hotkey.self_events_filtered(),
+            self._chatter_recoveries,
+        )
+        if not self.hotkey.is_alive():
+            log.error("hotkey listener thread is dead — reviving")
+            self.hotkey.restart()
 
     @pyqtSlot()
     def _on_hotkey_pressed(self):
-        save_frontmost_app()
-        self.recorder.start()
+        # The combo came back while we were waiting out a possible key bounce, so this
+        # was never a real release: keep the take running instead of chopping the
+        # sentence in two. Audio kept being captured throughout the gap.
+        if self._release_grace.isActive():
+            self._release_grace.stop()
+            self._chatter_recoveries += 1
+            log.info("combo re-formed within %d ms grace — continuing take (bounce #%d)",
+                     HOTKEY_RELEASE_GRACE_MS, self._chatter_recoveries)
+            return
+
+        # Never let an exception escape this slot: it would leave the recorder
+        # flagged as recording with no stream, and the pill stuck out of sync.
+        try:
+            save_frontmost_app()
+            self.recorder.start()
+        except Exception:
+            log.exception("failed to start recording")
+            self.hotkey.force_release()
+            self.recorder.is_recording = False
+            self.pill.set_state(PillWidget.STATE_ERROR)
+            return
         self.pill.set_state(PillWidget.STATE_RECORDING)
         self._record_start = time.time()
         self._hold_watchdog.start()
@@ -257,19 +325,45 @@ class SFlowApp(QObject):
             self._hold_watchdog.stop()
             return
         if time.time() - self._record_start > _MAX_RECORD_SECONDS:
+            log.warning("max duration reached (%ds) — force-stopping", _MAX_RECORD_SECONDS)
             self.hotkey.force_release()   # reset hotkey state so the next press works
-            self._on_hotkey_released()
+            self._finish_recording()      # no grace period: this is a hard stop
 
     @pyqtSlot()
     def _on_hotkey_released(self):
-        self._hold_watchdog.stop()
         if not self.recorder.is_recording:
             return  # already stopped (watchdog + real release, or a double event)
+        # Don't end the take yet — a chattering Ctrl produces a release followed by a
+        # press milliseconds later. Recording continues during the grace period, so if
+        # the combo comes back nothing is lost; otherwise _finish_recording() runs.
+        self._release_grace.start()
+
+    def _finish_recording(self):
+        self._hold_watchdog.stop()
+        self._release_grace.stop()
+        if not self.recorder.is_recording:
+            return
         duration = self.recorder.stop()
         self.pill.set_state(PillWidget.STATE_PROCESSING)
 
         if duration < 0.3:
             self.pill.set_state(PillWidget.STATE_IDLE)
+            return
+
+        # Never send silence to Whisper. It does not return "nothing" for silent audio —
+        # it hallucinates a plausible phrase ("Gracias.", "Subtitulado por...") which then
+        # gets pasted into whatever the user was writing. A take with no frames, or whose
+        # loudest sample is below the noise floor, means the mic gave us nothing (a dead
+        # endpoint, or another instance holding the device), so we surface an error
+        # instead of inventing text.
+        if not self.recorder.captured_sound():
+            log.warning(
+                "discarding silent take: %.1fs held, %d frames, peak=%d (threshold %d) — "
+                "mic captured nothing, not sending to Whisper",
+                duration, len(self.recorder.frames), self.recorder.peak,
+                SILENCE_PEAK_THRESHOLD,
+            )
+            self.pill.set_state(PillWidget.STATE_ERROR)
             return
 
         wav_buffer = self.recorder.get_wav_buffer()
@@ -282,23 +376,49 @@ class SFlowApp(QObject):
         thread.start()
 
     def _transcribe_worker(self, wav_buffer, duration):
+        started = time.time()
         try:
             text = self.transcriber.transcribe(wav_buffer)
+            elapsed = time.time() - started
             if text:
+                log.info("transcribed %.1fs audio in %.1fs | %d chars",
+                         duration, elapsed, len(text))
                 self.transcription_done.emit(text, duration)
             else:
+                log.warning("empty transcription for %.1fs audio (%.1fs)", duration, elapsed)
                 self.transcription_error.emit("No speech detected")
         except Exception as e:
-            self.transcription_error.emit(str(e))
+            # The API call is the single most likely thing to fail silently (expired
+            # key, VPN blocking Groq, 10s timeout). Record the type, not just str(e).
+            log.exception("transcription FAILED after %.1fs for %.1fs audio",
+                          time.time() - started, duration)
+            self.transcription_error.emit(f"{type(e).__name__}: {e}")
 
     @pyqtSlot(str, float)
     def _on_transcription_done(self, text: str, duration: float):
-        paste_text(text)
-        self.db.insert(text=text, duration_seconds=duration)
+        # Save to the DB even if pasting fails, so a good transcription is never lost
+        # to a locked clipboard — and so the pill can't get stranded on PROCESSING.
+        try:
+            paste_text(text)
+        except Exception:
+            log.exception("paste failed; text kept in history only")
+        try:
+            # Record the model/language actually used — the table's default is a stale
+            # hardcoded 'whisper-large-v3-turbo', which would make history unusable for
+            # comparing transcription quality across model changes.
+            self.db.insert(
+                text=text,
+                language=WHISPER_LANGUAGE,
+                duration_seconds=duration,
+                model=GROQ_MODEL,
+            )
+        except Exception:
+            log.exception("db insert failed")
         self.pill.set_state(PillWidget.STATE_DONE)
 
     @pyqtSlot(str)
     def _on_transcription_error(self, error: str):
+        log.warning("transcription error surfaced to user: %s", error)
         self.pill.set_state(PillWidget.STATE_ERROR)
 
 
@@ -325,9 +445,15 @@ def _acquire_single_instance() -> bool:
     if sys.platform == "win32":
         import ctypes
         ERROR_ALREADY_EXISTS = 183
-        kernel32 = ctypes.windll.kernel32
+        # use_last_error=True is REQUIRED: with plain ctypes.windll, GetLastError() is
+        # read through a separate foreign call that can clobber the very error code we
+        # are testing, so the "already running" case was missed and a second copy
+        # started — two instances then fought over the mic and one recorded pure
+        # silence, which Whisper turned into "Gracias.".
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
         handle = kernel32.CreateMutexW(None, True, "Local\\SFlow_SingleInstance")
-        if not handle or kernel32.GetLastError() == ERROR_ALREADY_EXISTS:
+        err = ctypes.get_last_error()
+        if not handle or err == ERROR_ALREADY_EXISTS:
             return False
         _INSTANCE_LOCK = handle
         return True
@@ -350,6 +476,8 @@ def _acquire_single_instance() -> bool:
 def main():
     # Refuse to start a duplicate (must run BEFORE anything grabs the mic/hotkey).
     if not _acquire_single_instance():
+        log.warning("another SFlow instance is already running — exiting (pid %d)",
+                    os.getpid())
         sys.exit(0)
 
     app = QApplication(sys.argv)
