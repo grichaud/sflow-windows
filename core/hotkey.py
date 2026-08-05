@@ -1,24 +1,19 @@
-import time
 from pynput import keyboard
 from PyQt6.QtCore import QObject, pyqtSignal
-from config import DOUBLE_TAP_INTERVAL
-
-# On Windows, pressing AltGr is delivered as a *synthetic* Left-Ctrl press
-# immediately followed by a RIGHT-Alt press (alt_gr / alt_r). The real record
-# shortcut uses the LEFT Alt (alt_l). We discriminate by key identity (left vs
-# right Alt), NOT by timing — a fast real Ctrl+LeftAlt is indistinguishable from
-# AltGr by timing alone. The window below is used ONLY to neutralize AltGr's
-# synthetic Ctrl for double-tap purposes.
-ALTGR_WINDOW = 0.06  # seconds
 
 
 class HotkeyListener(QObject):
-    """Global hotkey listener with two modes:
+    """Global hotkey: hold LEFT Ctrl + LEFT Alt to record (press and hold).
 
-    1. Hold LEFT Ctrl + LEFT Alt: press-and-hold recording.
-    2. Double-tap Ctrl: hands-free mode (tap Ctrl again to stop).
+    Right Alt / AltGr is ignored so typing @ { [ (AltGr on a Spanish keyboard)
+    never triggers recording.
 
-    AltGr (Right Alt) is explicitly ignored so it never triggers recording.
+    There is NO double-tap / hands-free mode. It used to exist (double-tap Ctrl
+    to toggle recording) but it collided with normal Ctrl usage — Ctrl+C then
+    Ctrl+V within 0.4 s, or just holding Ctrl (which auto-repeats), looked like a
+    "double tap" and started a hidden recording that pasted "Gracias." and left
+    SFlow stuck listening (with `_recording` stuck True, plain Ctrl+Alt then did
+    nothing until SFlow was restarted).
     """
 
     pressed = pyqtSignal()
@@ -29,15 +24,7 @@ class HotkeyListener(QObject):
         self._ctrl_held = False
         self._alt_l_held = False
         self._recording = False
-        self._hands_free = False
         self._listener: keyboard.Listener | None = None
-
-        # Double-tap detection
-        self._last_ctrl_press = 0.0
-        self._ctrl_tap_count = 0
-
-        # AltGr disambiguation: timestamp of the last Ctrl press
-        self._last_ctrl_press_time = 0.0
 
     def start(self):
         self._listener = keyboard.Listener(
@@ -56,52 +43,21 @@ class HotkeyListener(QObject):
         is_ctrl = key in (keyboard.Key.ctrl_l, keyboard.Key.ctrl_r)
         is_alt_left = key in (keyboard.Key.alt_l, keyboard.Key.alt)
         is_alt_right = key in (keyboard.Key.alt_r, keyboard.Key.alt_gr)
-        now = time.time()
 
-        # AltGr / RIGHT Alt: never a trigger.
+        # Right Alt / AltGr is never part of the shortcut (and injects a
+        # synthetic Left-Ctrl on Windows) — clear left-alt state and bail.
         if is_alt_right:
-            # Neutralize the synthetic Left-Ctrl that Windows injects right
-            # before AltGr, so it can't feed the double-tap detector.
-            if now - self._last_ctrl_press_time < ALTGR_WINDOW:
-                self._ctrl_held = False
-                self._ctrl_tap_count = 0
-                self._last_ctrl_press = 0.0
             self._alt_l_held = False
             return
 
-        if is_alt_left:
+        if is_ctrl:
+            self._ctrl_held = True
+        elif is_alt_left:
             self._alt_l_held = True
 
-        elif is_ctrl:
-            self._ctrl_held = True
-            self._last_ctrl_press_time = now
-
-            # Hands-free: if recording, single Ctrl press stops it
-            if self._hands_free and self._recording:
-                self._hands_free = False
-                self._recording = False
-                self.released.emit()
-                return
-
-            # Double-tap detection
-            if now - self._last_ctrl_press < DOUBLE_TAP_INTERVAL:
-                self._ctrl_tap_count += 1
-            else:
-                self._ctrl_tap_count = 1
-            self._last_ctrl_press = now
-
-            if self._ctrl_tap_count >= 2 and not self._recording:
-                # Double-tap Ctrl -> hands-free mode
-                self._ctrl_tap_count = 0
-                self._hands_free = True
-                self._recording = True
-                self.pressed.emit()
-                return
-
-        # Hold mode: LEFT Ctrl + LEFT Alt together
+        # Hold mode: LEFT Ctrl + LEFT Alt held together.
         if self._ctrl_held and self._alt_l_held and not self._recording:
             self._recording = True
-            self._hands_free = False
             self.pressed.emit()
 
     def _on_release(self, key):
@@ -114,8 +70,15 @@ class HotkeyListener(QObject):
         elif is_alt:
             self._alt_l_held = False
 
-        # Hold mode: stop when the combo is broken (but not in hands-free mode)
-        if self._recording and not self._hands_free:
-            if not (self._ctrl_held and self._alt_l_held):
-                self._recording = False
-                self.released.emit()
+        # Stop as soon as the combo is broken.
+        if self._recording and not (self._ctrl_held and self._alt_l_held):
+            self._recording = False
+            self.released.emit()
+
+    def force_release(self):
+        """Reset key/recording state without emitting (used by the watchdog
+        when a take ran too long — the caller drives the stop path). Ensures the
+        next press works cleanly."""
+        self._ctrl_held = False
+        self._alt_l_held = False
+        self._recording = False

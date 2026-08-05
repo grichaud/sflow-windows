@@ -126,9 +126,10 @@ class AudioRecorder:
         self.is_recording = False
         self._start_time = 0.0
         self._peak = 0  # loudest sample this recording (to detect a wedged mic)
-        # Start "suspect" so the very first take after launch re-arms the mic —
-        # handles the common case of restarting SFlow *because* it went silent.
-        self._suspect_stuck = True
+        # Only re-arm the endpoint AFTER a take actually comes back silent — a
+        # proactive warm-up on the first take added latency and could leave a
+        # sliver of leading silence that Whisper transcribes as "Gracias.".
+        self._suspect_stuck = False
 
     def _callback(self, indata: np.ndarray, frames: int, time_info, status):
         if status:

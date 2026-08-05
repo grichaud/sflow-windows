@@ -3,6 +3,7 @@
 
 import os
 import sys
+import time
 import signal
 import subprocess
 import threading
@@ -10,7 +11,7 @@ from PyQt6.QtWidgets import (
     QApplication, QSystemTrayIcon, QMenu,
     QDialog, QVBoxLayout, QLabel, QLineEdit, QPushButton, QMessageBox,
 )
-from PyQt6.QtCore import Qt, QObject, pyqtSignal, pyqtSlot
+from PyQt6.QtCore import Qt, QObject, QTimer, pyqtSignal, pyqtSlot
 from PyQt6.QtGui import QIcon, QPixmap, QAction
 
 from ui.pill_widget import PillWidget
@@ -199,6 +200,10 @@ def _setup_tray(app: QApplication, port: int) -> QSystemTrayIcon:
 # ---------------------------------------------------------------------------
 # Main app controller
 # ---------------------------------------------------------------------------
+_MAX_RECORD_SECONDS = 300  # hard cap (5 min) so a stuck recording can't run forever;
+# generous enough for long dictations — a shorter cap cut real dictations off.
+
+
 class SFlowApp(QObject):
     """Main application controller. Wires hotkey -> recorder -> transcriber -> clipboard."""
 
@@ -216,6 +221,14 @@ class SFlowApp(QObject):
         # Connect visualizer to recorder's audio queue
         self.pill.visualizer.set_audio_queue(self.recorder.audio_queue)
 
+        # Watchdog: while recording, poll the REAL keyboard state so a dropped
+        # key-release event can't leave SFlow stuck listening (and enforce a max
+        # duration). Runs on the main thread (QTimer parented to this QObject).
+        self._record_start = 0.0
+        self._hold_watchdog = QTimer(self)
+        self._hold_watchdog.setInterval(350)
+        self._hold_watchdog.timeout.connect(self._check_hold)
+
         # MUST use QueuedConnection: pynput emits from its own thread
         self.hotkey.pressed.connect(self._on_hotkey_pressed, Qt.ConnectionType.QueuedConnection)
         self.hotkey.released.connect(self._on_hotkey_released, Qt.ConnectionType.QueuedConnection)
@@ -232,9 +245,26 @@ class SFlowApp(QObject):
         save_frontmost_app()
         self.recorder.start()
         self.pill.set_state(PillWidget.STATE_RECORDING)
+        self._record_start = time.time()
+        self._hold_watchdog.start()
+
+    def _check_hold(self):
+        """Safety cap only: force-stop a recording that has run too long (e.g. a
+        key-release was dropped and it's stuck 'on'). We do NOT poll the physical
+        key state — GetAsyncKeyState proved unreliable here and cut off speech
+        mid-sentence; pynput's release event is what normally stops recording."""
+        if not self.recorder.is_recording:
+            self._hold_watchdog.stop()
+            return
+        if time.time() - self._record_start > _MAX_RECORD_SECONDS:
+            self.hotkey.force_release()   # reset hotkey state so the next press works
+            self._on_hotkey_released()
 
     @pyqtSlot()
     def _on_hotkey_released(self):
+        self._hold_watchdog.stop()
+        if not self.recorder.is_recording:
+            return  # already stopped (watchdog + real release, or a double event)
         duration = self.recorder.stop()
         self.pill.set_state(PillWidget.STATE_PROCESSING)
 
