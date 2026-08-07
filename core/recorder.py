@@ -6,7 +6,7 @@ import numpy as np
 import sounddevice as sd
 from config import (
     SAMPLE_RATE, CHANNELS, AUDIO_DTYPE, BLOCK_SIZE, MIC_DEVICE_HINTS,
-    SILENCE_PEAK_THRESHOLD,
+    SILENCE_PEAK_THRESHOLD, CLIP_LEVEL,
 )
 
 
@@ -152,6 +152,8 @@ class AudioRecorder:
         self.is_recording = False
         self._start_time = 0.0
         self._peak = 0  # loudest sample this recording (to detect a wedged mic)
+        self._clipped = 0        # samples pinned at full scale (input level too high)
+        self._total_samples = 0
         # Only re-arm the endpoint AFTER a take actually comes back silent — a
         # proactive warm-up on the first take added latency and could leave a
         # sliver of leading silence that Whisper transcribes as "Gracias.".
@@ -167,9 +169,16 @@ class AudioRecorder:
             return  # stream is kept open between takes; ignore anything outside a take
         self.audio_queue.put(indata.copy())
         self.frames.append(indata.copy())
-        peak = int(np.abs(indata).max())
+        mag = np.abs(indata)
+        peak = int(mag.max())
         if peak > self._peak:
             self._peak = peak
+        # Count samples pinned at (near) full scale. Once the input level is high enough
+        # to clip, the waveform is squared off and the information is destroyed before
+        # we ever see it — no amount of processing recovers it, and Whisper transcribes
+        # clipped speech badly or drops it. Only lowering the mic level in Windows helps.
+        self._clipped += int((mag >= CLIP_LEVEL).sum())
+        self._total_samples += mag.size
 
     def _ensure_stream(self):
         """Open the capture stream if it isn't already. Kept open across takes.
@@ -221,6 +230,8 @@ class AudioRecorder:
     def start(self):
         self.frames.clear()
         self._peak = 0
+        self._clipped = 0
+        self._total_samples = 0
         # Drain any old data from the queue
         while not self.audio_queue.empty():
             try:
@@ -312,6 +323,14 @@ class AudioRecorder:
     def peak(self) -> int:
         """Loudest int16 sample of the last take (0 if nothing was captured)."""
         return self._peak
+
+    @property
+    def clip_percent(self) -> float:
+        """Percentage of samples pinned at full scale. Above ~0.5% speech is audibly
+        distorted; above ~2% transcription quality collapses."""
+        if not self._total_samples:
+            return 0.0
+        return self._clipped / self._total_samples * 100.0
 
     def captured_sound(self) -> bool:
         """True if this take actually contains audio worth transcribing."""

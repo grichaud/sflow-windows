@@ -1,7 +1,7 @@
 import sys
 import time
 
-from config import SYNTHETIC_INPUT_TAG
+from config import SYNTHETIC_INPUT_TAG, PASTE_SETTLE_SECONDS
 
 _saved_hwnd: int | None = None
 
@@ -45,6 +45,13 @@ if sys.platform == "win32":
 
         # Simulate Ctrl+V
         _send_ctrl_v()
+
+        # SendInput only QUEUES the keystroke; the target app pastes it later, reading
+        # the clipboard at that moment. Back-to-back pastes (a chattering hotkey can
+        # produce three in one second) would overwrite the clipboard before the
+        # previous Ctrl+V was consumed, so earlier fragments silently vanished and only
+        # the last one landed. Hold here long enough for the paste to be serviced.
+        time.sleep(PASTE_SETTLE_SECONDS)
         _saved_hwnd = None
 
     def _set_clipboard_ctypes(text: str):

@@ -60,6 +60,12 @@ BLOCK_SIZE = 1024
 # real speech, including a distant or quiet voice, but above the mic's noise floor.
 SILENCE_PEAK_THRESHOLD = 30
 
+# int16 magnitude at/above which a sample counts as clipped (full scale is 32767).
+# Clipping squares off the waveform and destroys information before SFlow sees it;
+# it cannot be fixed in software, only by lowering the mic level in Windows.
+CLIP_LEVEL = 32000
+CLIP_WARN_PERCENT = 0.5  # log a warning once this share of a take is clipped
+
 # Preferred input device (microphone).
 # SFlow does NOT blindly follow the Windows default input device: plugging in
 # headphones can switch the default to a dead/incompatible input (e.g. a
@@ -94,6 +100,15 @@ BAR_GAIN = 8.0
 # Hotkey
 DOUBLE_TAP_INTERVAL = 0.4  # seconds for double-tap detection
 
+# Longer grace used right after a bounce was absorbed, and how long that lasts.
+# Measured over 82 real bounces from this keyboard: p50=47ms, p90=375ms, p95=664ms,
+# max=1464ms. A flat 250ms window catches only 83% of them and the stragglers are what
+# still split sentences; a flat 900ms window would delay EVERY dictation's paste by
+# almost a second. Bounces arrive in bursts, so the window widens only once chattering
+# has been seen in the last CHATTER_WINDOW_SECONDS and relaxes back on its own.
+HOTKEY_RELEASE_GRACE_CHATTER_MS = 900
+CHATTER_WINDOW_SECONDS = 6.0
+
 # Grace period before a broken combo actually ends a dictation.
 # This laptop's left Ctrl chatters: while the user holds Ctrl+Alt the driver reports
 # genuine (injected=False) key-up/key-down pairs 7-16 ms apart. Without a grace period
@@ -103,7 +118,7 @@ DOUBLE_TAP_INTERVAL = 0.4  # seconds for double-tap detection
 # If the combo is re-formed within this window, the take simply continues; audio keeps
 # being captured throughout, so nothing is lost in the gap. The cost is this much extra
 # delay before the paste appears, so keep it short.
-HOTKEY_RELEASE_GRACE_MS = 250
+HOTKEY_RELEASE_GRACE_MS = 300
 
 # Marker stamped into dwExtraInfo of every key event SFlow injects itself (the Ctrl+V
 # it sends to paste). The hotkey hook sees injected input just like real typing, so
@@ -112,6 +127,12 @@ HOTKEY_RELEASE_GRACE_MS = 250
 # held Alt to start phantom recordings that pasted garbage. Any value works as long as
 # clipboard.py stamps it and hotkey.py filters on it.
 SYNTHETIC_INPUT_TAG = 0x5F10C0DE
+
+# How long paste_text() waits after sending Ctrl+V before it is allowed to touch the
+# clipboard again. SendInput only queues the keystroke, so without this the next paste
+# overwrote the clipboard first and the earlier text was lost — the user saw only the
+# last fragment of a sentence. Costs this much per paste, so keep it modest.
+PASTE_SETTLE_SECONDS = 0.15
 
 # Database (writable user data)
 DB_PATH = os.path.join(_DATA_DIR, "transcriptions.db")

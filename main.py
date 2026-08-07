@@ -25,6 +25,7 @@ from web.server import start_web_server
 from config import (
     LOGO_PATH, APP_DATA_DIR, GROQ_API_KEY, GROQ_MODEL, WHISPER_LANGUAGE,
     SILENCE_PEAK_THRESHOLD, HOTKEY_RELEASE_GRACE_MS,
+    HOTKEY_RELEASE_GRACE_CHATTER_MS, CHATTER_WINDOW_SECONDS, CLIP_WARN_PERCENT,
 )
 
 setup_logging()
@@ -239,9 +240,9 @@ class SFlowApp(QObject):
         # Debounce for a chattering Ctrl key — see HOTKEY_RELEASE_GRACE_MS.
         self._release_grace = QTimer(self)
         self._release_grace.setSingleShot(True)
-        self._release_grace.setInterval(HOTKEY_RELEASE_GRACE_MS)
         self._release_grace.timeout.connect(self._finish_recording)
         self._chatter_recoveries = 0
+        self._last_bounce_at = 0.0
 
         # Health heartbeat — see _beat().
         self._heartbeat = QTimer(self)
@@ -297,8 +298,9 @@ class SFlowApp(QObject):
         if self._release_grace.isActive():
             self._release_grace.stop()
             self._chatter_recoveries += 1
-            log.info("combo re-formed within %d ms grace — continuing take (bounce #%d)",
-                     HOTKEY_RELEASE_GRACE_MS, self._chatter_recoveries)
+            self._last_bounce_at = time.time()
+            log.info("combo re-formed within grace — continuing take (bounce #%d)",
+                     self._chatter_recoveries)
             return
 
         # Never let an exception escape this slot: it would leave the recorder
@@ -336,7 +338,18 @@ class SFlowApp(QObject):
         # Don't end the take yet — a chattering Ctrl produces a release followed by a
         # press milliseconds later. Recording continues during the grace period, so if
         # the combo comes back nothing is lost; otherwise _finish_recording() runs.
-        self._release_grace.start()
+        self._release_grace.start(self._grace_ms())
+
+    def _grace_ms(self) -> int:
+        """Wait longer while the keyboard is actively chattering.
+
+        Bounces come in bursts, so once one is seen we widen the window to cover the
+        slow stragglers (up to ~1.4 s were measured) and let it relax back afterwards.
+        This keeps normal dictations from paying that delay on every paste.
+        """
+        if time.time() - self._last_bounce_at < CHATTER_WINDOW_SECONDS:
+            return HOTKEY_RELEASE_GRACE_CHATTER_MS
+        return HOTKEY_RELEASE_GRACE_MS
 
     def _finish_recording(self):
         self._hold_watchdog.stop()
@@ -365,6 +378,19 @@ class SFlowApp(QObject):
             )
             self.pill.set_state(PillWidget.STATE_ERROR)
             return
+
+        # Record the input level of every take. Clipping cannot be undone in software,
+        # so this is the only way to tell "the transcription is bad" apart from "the mic
+        # level in Windows is too high and the audio arrived already destroyed".
+        clip = self.recorder.clip_percent
+        if clip >= CLIP_WARN_PERCENT:
+            log.warning(
+                "INPUT TOO LOUD: %.1f%% of this take is clipped (peak=%d/32767). "
+                "Speech is distorted before SFlow receives it — lower the microphone "
+                "level in Windows Sound settings.", clip, self.recorder.peak,
+            )
+        else:
+            log.info("level ok | peak=%d/32767 clipped=%.2f%%", self.recorder.peak, clip)
 
         wav_buffer = self.recorder.get_wav_buffer()
         recording_duration = self.recorder.get_duration()
